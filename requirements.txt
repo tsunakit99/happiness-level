@@ -1,0 +1,7 @@
+falcon
+opencv-python
+opencv-python-headless
+numpy
+wheel
+dlib
+requests
