@@ -8,3 +8,5 @@ requests
 xgboost
 scikit-learn
 pandas
+tensorflow
+matplotlib
