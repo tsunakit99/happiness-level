@@ -6,7 +6,7 @@ import cv2
 import dlib
 import falcon
 import numpy as np
-from image2string import image2string
+import xgboost as xgb
 from string2image import string2image
 
 
@@ -14,13 +14,28 @@ class HappinessMeterResource:
     def __init__(self):
         # Dlibの顔検出器とランドマーク検出器を初期化
         self.detector = dlib.get_frontal_face_detector()
-        # 動的にファイルパスを解決
-        model_path = Path(__file__).resolve().parent.parent / "models/shape_predictor_68_face_landmarks.dat/shape_predictor_68_face_landmarks.dat"
-        
+
+        # モデルのパスを解決
+        model_path = Path(__file__).resolve().parent.parent / "models/shape_predictor_68_face_landmarks.dat"
         if not model_path.exists():
             raise FileNotFoundError(f"Model file not found: {model_path}")
-        
+
         self.predictor = dlib.shape_predictor(str(model_path))
+
+        # 機械学習モデルと標準化パラメータをロード
+        self.model = xgb.Booster()
+        model_file = Path(__file__).resolve().parent.parent / "models/happiness_model.json"
+        if not model_file.exists():
+            raise FileNotFoundError(f"Machine learning model not found: {model_file}")
+        self.model.load_model(str(model_file))
+
+        mean_file = Path(__file__).resolve().parent.parent / "data/feature_mean.npy"
+        std_file = Path(__file__).resolve().parent.parent / "data/feature_std.npy"
+        if not mean_file.exists() or not std_file.exists():
+            raise FileNotFoundError("Feature mean and std files not found.")
+
+        self.mean = np.load(str(mean_file))
+        self.std = np.load(str(std_file))
 
     def on_post(self, req, resp):
         # POSTされたデータを受け取る
@@ -33,13 +48,13 @@ class HappinessMeterResource:
         # 幸せ度合いを計算
         happiness_score, processed_image = self.calculate_happiness(img)
 
-        # 処理後の画像をBase64にエンコード
-        processed_img_as_text = image2string(processed_image, False)
+        # 処理済み画像を保存
+        output_path = self.save_processed_image(processed_image)
 
         # JSON応答を作成
         response_data = {
             "happiness_score": happiness_score,
-            "processed_image": processed_img_as_text
+            "processed_image_path": output_path
         }
 
         resp.text = json.dumps(response_data)
@@ -67,7 +82,7 @@ class HappinessMeterResource:
         face_width = face.right() - face.left()
         face_height = face.bottom() - face.top()
 
-        # ランドマークから特徴量を計算
+        # 特徴量の計算
         left_mouth_corner = points[48]  # 口の左端
         right_mouth_corner = points[54]  # 口の右端
         upper_lip = points[51]  # 上唇の中央
@@ -102,46 +117,31 @@ class HappinessMeterResource:
         brow_distance = np.linalg.norm(brow_center[0] - brow_center[1])
         normalized_brow_distance = brow_distance / face_width
 
-        # スコアリング
-        happiness_score = 50  # 基準スコア
+        # 特徴量を配列にまとめる
+        feature_vector = np.array([
+            mouth_angle,
+            normalized_mouth_height,
+            normalized_mouth_width,
+            mouth_ratio,
+            normalized_eye_height,
+            normalized_brow_distance
+        ])
 
-        # 条件分岐を用いたスコアリング
-        if normalized_eye_height < 0.03 and normalized_mouth_height > 0.05:
-            # 目が細く、口が開いている -> 笑顔
-            happiness_score += 20
-        elif normalized_eye_height > 0.035 and normalized_mouth_height > 0.05:
-            # 目が大きく開き、口が開いている -> 怒りまたは驚き
-            happiness_score -= 20
-        else:
-            # その他の場合、各特徴量に基づいてスコアを調整
-            # 口角の角度によるスコア
-            if mouth_angle < -15:
-                happiness_score += 10
-            elif mouth_angle > 15:
-                happiness_score -= 10
+        # 特徴量の標準化
+        feature_vector_standardized = (feature_vector - self.mean) / self.std
 
-            # 口の高さと幅の比率によるスコア
-            if 0.3 <= mouth_ratio <= 0.6:
-                happiness_score += 5
-            elif mouth_ratio > 0.6:
-                happiness_score -= 5
-
-            # 眉間の距離によるスコア
-            if normalized_brow_distance < 0.1:
-                happiness_score -= 10
-
-        # デバッグ情報の出力（詳細）
-        print(f"Debug Info:")
-        print(f"mouth_angle: {mouth_angle:.2f}")
-        print(f"normalized_mouth_height: {normalized_mouth_height:.4f}")
-        print(f"normalized_mouth_width: {normalized_mouth_width:.4f}")
-        print(f"mouth_ratio: {mouth_ratio:.4f}")
-        print(f"normalized_eye_height: {normalized_eye_height:.4f}")
-        print(f"normalized_brow_distance: {normalized_brow_distance:.4f}")
-        print(f"happiness_score: {happiness_score}")
+        # 機械学習モデルで予測
+        dmatrix = xgb.DMatrix([feature_vector_standardized])
+        happiness_score = self.model.predict(dmatrix)[0]
 
         # スコアの範囲を0から100に制限
-        happiness_score = min(max(happiness_score, 0), 100)
+        happiness_score = float(np.clip(happiness_score, 0, 100))
+
+        # デバッグ情報の出力
+        print(f"Debug Info:")
+        print(f"Features: {feature_vector}")
+        print(f"Standardized Features: {feature_vector_standardized}")
+        print(f"Happiness Score: {happiness_score}")
 
         # ランドマークを描画
         for (x, y) in points:
@@ -149,6 +149,25 @@ class HappinessMeterResource:
 
         return happiness_score, img
 
+    def save_processed_image(self, img):
+        """
+        処理済みの画像を保存するメソッド。
+        :param img: 処理済みの画像
+        :return: 保存先のファイルパス
+        """
+        # 画像を保存するディレクトリを定義
+        output_dir = Path(__file__).resolve().parent / "processed_images"
+        output_dir.mkdir(exist_ok=True)
+
+        # UUIDを使用して一意のファイル名を生成
+        import uuid
+        file_name = f"processed_{uuid.uuid4().hex}.jpg"
+        output_path = output_dir / file_name
+
+        # 画像を保存
+        cv2.imwrite(str(output_path), img)
+
+        return str(output_path)
 
 
 # Falconアプリケーションの初期化
@@ -163,6 +182,6 @@ if __name__ == "__main__":
     server_ip = '127.0.0.1'
     server_port = 8000
     print(f"Server running on http://{server_ip}:{server_port}/HappinessMeter")
-    
+
     with make_server(server_ip, server_port, app) as httpd:
         httpd.serve_forever()

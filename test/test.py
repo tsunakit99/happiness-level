@@ -3,7 +3,7 @@ import base64
 import requests
 
 # 画像をBase64にエンコード
-with open("../public/example_images/neutral2.jpg", "rb") as img_file:
+with open("../public/example_images/smile2.jpg", "rb") as img_file:
     img_as_text = base64.b64encode(img_file.read()).decode("utf-8")
 
 # APIにリクエストを送信
